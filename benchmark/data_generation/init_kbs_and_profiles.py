@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,11 @@ logger = logging.getLogger("benchmark.init_kbs_profiles")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CONFIG = PROJECT_ROOT / "benchmark" / "config" / "benchmark_config.yaml"
 DEFAULT_DOCS_DIR = PROJECT_ROOT.parent / "documents"
+MAX_CONCURRENCY = 5
+
+
+class PipelineAbortError(RuntimeError):
+    """Abort all processing when any single PDF pipeline fails."""
 
 
 def _sanitize_kb_name(name: str) -> str:
@@ -57,6 +63,26 @@ def _unique_name(base: str, used: set[str]) -> str:
 def _load_config(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def _cleanup_failed_kb_data(kb_base_dir: Path, kb_name: str, output_dir: Path) -> None:
+    """Remove artifacts for a failed PDF pipeline."""
+    kb_dir = kb_base_dir / kb_name
+    output_json = output_dir / f"{kb_name}.json"
+
+    if output_json.exists():
+        try:
+            output_json.unlink()
+            logger.info("Removed failed output file: %s", output_json)
+        except Exception as e:
+            logger.warning("Failed to remove output file %s: %s", output_json, e)
+
+    if kb_dir.exists():
+        try:
+            shutil.rmtree(kb_dir)
+            logger.info("Removed failed KB directory: %s", kb_dir)
+        except Exception as e:
+            logger.warning("Failed to remove KB directory %s: %s", kb_dir, e)
 
 
 async def _process_pdf(
@@ -115,6 +141,46 @@ async def _process_pdf(
         json.dump(out, f, ensure_ascii=False, indent=2)
     logger.info("Saved: %s", out_path)
     return out
+
+
+async def _process_pdf_guarded(
+    *,
+    pdf_path: Path,
+    kb_name: str,
+    kb_base_dir: Path,
+    profile_cfg: dict,
+    rag_cfg: dict,
+    output_dir: Path,
+    skip_extract: bool,
+    semaphore: asyncio.Semaphore,
+    fail_event: asyncio.Event,
+) -> dict | None:
+    """Run one PDF pipeline with fail-fast cleanup semantics."""
+    if fail_event.is_set():
+        return None
+
+    async with semaphore:
+        if fail_event.is_set():
+            return None
+        try:
+            return await _process_pdf(
+                pdf_path=pdf_path,
+                kb_name=kb_name,
+                kb_base_dir=kb_base_dir,
+                profile_cfg=profile_cfg,
+                rag_cfg=rag_cfg,
+                output_dir=output_dir,
+                skip_extract=skip_extract,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("Failed on %s -> %s: %s", pdf_path.name, kb_name, e)
+            _cleanup_failed_kb_data(kb_base_dir=kb_base_dir, kb_name=kb_name, output_dir=output_dir)
+            fail_event.set()
+            raise PipelineAbortError(
+                f"Pipeline failed for {pdf_path.name} (kb={kb_name}). Program terminated."
+            ) from e
 
 
 async def main() -> None:
@@ -180,11 +246,17 @@ async def main() -> None:
         raise ValueError(f"No PDF files found in: {docs_dir}")
 
     used_names: set[str] = set()
-    results = []
+    jobs = []
     for pdf in pdfs:
         kb_name = _unique_name(_sanitize_kb_name(pdf.stem), used_names)
-        try:
-            result = await _process_pdf(
+        jobs.append((pdf, kb_name))
+
+    logger.info("Starting pipelines with max concurrency = %d", MAX_CONCURRENCY)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+    fail_event = asyncio.Event()
+    tasks = [
+        asyncio.create_task(
+            _process_pdf_guarded(
                 pdf_path=pdf,
                 kb_name=kb_name,
                 kb_base_dir=kb_base_dir,
@@ -192,10 +264,36 @@ async def main() -> None:
                 rag_cfg=rag_cfg,
                 output_dir=output_dir,
                 skip_extract=args.skip_extract,
-            )
-            results.append(result)
-        except Exception as e:
-            logger.exception("Failed on %s -> %s: %s", pdf.name, kb_name, e)
+                semaphore=semaphore,
+                fail_event=fail_event,
+            ),
+            name=kb_name,
+        )
+        for pdf, kb_name in jobs
+    ]
+
+    results = []
+    pending = set(tasks)
+    fatal_error: Exception | None = None
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_EXCEPTION)
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                fatal_error = exc
+                break
+            result = task.result()
+            if result is not None:
+                results.append(result)
+        if fatal_error is not None:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            break
+
+    if fatal_error is not None:
+        logger.error("Aborting due to pipeline failure: %s", fatal_error)
+        raise SystemExit(1)
 
     summary = {
         "timestamp": timestamp,
