@@ -117,6 +117,21 @@ class RAGAnythingDoclingPipeline:
         self._instances[working_dir] = rag
         return rag
 
+    def _set_init_llm_thinking_disabled(self, rag: Any) -> dict[str, Any] | None:
+        """Disable model thinking only during KB initialization."""
+        lightrag_inst = getattr(rag, "lightrag", None)
+        if lightrag_inst is None or not hasattr(lightrag_inst, "llm_model_kwargs"):
+            return None
+
+        original_kwargs = dict(getattr(lightrag_inst, "llm_model_kwargs", {}) or {})
+        patched = dict(original_kwargs)
+        patched["enable_thinking"] = False
+        extra_body = dict(patched.get("extra_body", {}) or {})
+        extra_body["enable_thinking"] = False
+        patched["extra_body"] = extra_body
+        lightrag_inst.llm_model_kwargs = patched
+        return original_kwargs
+
     async def initialize(
         self,
         kb_name: str,
@@ -180,69 +195,74 @@ class RAGAnythingDoclingPipeline:
         with LightRAGLogContext(scene="knowledge_init"):
             rag = self._get_rag_instance(kb_name)
             await rag._ensure_lightrag_initialized()
+            original_llm_kwargs = self._set_init_llm_thinking_disabled(rag)
 
             total_files = len(classification.needs_mineru) + len(classification.text_files)
             idx = 0
             total_images_migrated = 0
 
-            # Process files requiring Docling (PDF, DOCX, images, HTML)
-            for file_path in classification.needs_mineru:
-                idx += 1
-                file_name = Path(file_path).name
-                self.logger.info(f"Processing [{idx}/{total_files}] (Docling): {file_name}")
+            try:
+                # Process files requiring Docling (PDF, DOCX, images, HTML)
+                for file_path in classification.needs_mineru:
+                    idx += 1
+                    file_name = Path(file_path).name
+                    self.logger.info(f"Processing [{idx}/{total_files}] (Docling): {file_name}")
 
-                # Step 1: Parse document (without RAG insertion)
-                self.logger.info("  Step 1/3: Parsing document...")
-                content_list, doc_id = await rag.parse_document(
-                    file_path=file_path,
-                    output_dir=str(content_list_dir),
-                    parse_method="auto",
-                )
+                    # Step 1: Parse document (without RAG insertion)
+                    self.logger.info("  Step 1/3: Parsing document...")
+                    content_list, doc_id = await rag.parse_document(
+                        file_path=file_path,
+                        output_dir=str(content_list_dir),
+                        parse_method="auto",
+                    )
 
-                # Step 2: Migrate images and update paths
-                self.logger.info("  Step 2/3: Migrating images to canonical location...")
-                updated_content_list, num_migrated = await migrate_images_and_update_paths(
-                    content_list=content_list,
-                    source_base_dir=content_list_dir,
-                    target_images_dir=images_dir,
-                    batch_size=50,
-                )
-                total_images_migrated += num_migrated
+                    # Step 2: Migrate images and update paths
+                    self.logger.info("  Step 2/3: Migrating images to canonical location...")
+                    updated_content_list, num_migrated = await migrate_images_and_update_paths(
+                        content_list=content_list,
+                        source_base_dir=content_list_dir,
+                        target_images_dir=images_dir,
+                        batch_size=50,
+                    )
+                    total_images_migrated += num_migrated
 
-                # Save updated content_list for future reference
-                content_list_file = content_list_dir / f"{Path(file_path).stem}.json"
-                with open(content_list_file, "w", encoding="utf-8") as f:
-                    json.dump(updated_content_list, f, ensure_ascii=False, indent=2)
+                    # Save updated content_list for future reference
+                    content_list_file = content_list_dir / f"{Path(file_path).stem}.json"
+                    with open(content_list_file, "w", encoding="utf-8") as f:
+                        json.dump(updated_content_list, f, ensure_ascii=False, indent=2)
 
-                # Step 3: Insert into RAG with corrected paths
-                self.logger.info("  Step 3/3: Inserting into RAG knowledge graph...")
-                await rag.insert_content_list(
-                    content_list=updated_content_list,
-                    file_path=file_path,
-                    doc_id=doc_id,
-                )
+                    # Step 3: Insert into RAG with corrected paths
+                    self.logger.info("  Step 3/3: Inserting into RAG knowledge graph...")
+                    await rag.insert_content_list(
+                        content_list=updated_content_list,
+                        file_path=file_path,
+                        doc_id=doc_id,
+                    )
 
-                self.logger.info(f"  ✓ Completed: {file_name}")
+                    self.logger.info(f"  ✓ Completed: {file_name}")
 
-            # Process text files directly (fast path)
-            for file_path in classification.text_files:
-                idx += 1
-                self.logger.info(
-                    f"Processing [{idx}/{total_files}] (direct text): {Path(file_path).name}"
-                )
-                content = await FileTypeRouter.read_text_file(file_path)
-                if content.strip():
-                    # Insert directly into LightRAG, bypassing parser
-                    await rag.lightrag.ainsert(content)
+                # Process text files directly (fast path)
+                for file_path in classification.text_files:
+                    idx += 1
+                    self.logger.info(
+                        f"Processing [{idx}/{total_files}] (direct text): {Path(file_path).name}"
+                    )
+                    content = await FileTypeRouter.read_text_file(file_path)
+                    if content.strip():
+                        # Insert directly into LightRAG, bypassing parser
+                        await rag.lightrag.ainsert(content)
 
-            # Log unsupported files
-            for file_path in classification.unsupported:
-                self.logger.warning(f"Skipped unsupported file: {Path(file_path).name}")
+                # Log unsupported files
+                for file_path in classification.unsupported:
+                    self.logger.warning(f"Skipped unsupported file: {Path(file_path).name}")
 
-            # Clean up temporary parser output directories
-            if total_images_migrated > 0:
-                self.logger.info("Cleaning up temporary parser output directories...")
-                await cleanup_parser_output_dirs(content_list_dir)
+                # Clean up temporary parser output directories
+                if total_images_migrated > 0:
+                    self.logger.info("Cleaning up temporary parser output directories...")
+                    await cleanup_parser_output_dirs(content_list_dir)
+            finally:
+                if original_llm_kwargs is not None and getattr(rag, "lightrag", None) is not None:
+                    rag.lightrag.llm_model_kwargs = original_llm_kwargs
 
         if extract_numbered_items:
             await self._extract_numbered_items(kb_name)
