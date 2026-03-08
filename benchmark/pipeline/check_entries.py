@@ -38,6 +38,36 @@ ANSI_RESET = "\033[0m"
 
 FIX_RETRY_ATTEMPTS = 3
 FIX_RETRY_DELAY_SEC = 3.0
+EXPECTED_ENTRIES_PER_PROFILE = 3
+
+
+def _load_entries_jsonl(path: Path) -> list[dict]:
+    entries: list[dict] = []
+    if not path.exists():
+        return entries
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    return entries
+
+
+def _extract_task_index(entry_id: str) -> int:
+    marker = "_task_"
+    if marker not in entry_id:
+        return 0
+    try:
+        return int(entry_id.rsplit(marker, 1)[-1])
+    except Exception:
+        return 0
+
+
+def _next_task_index(entries: list[dict]) -> int:
+    max_idx = 0
+    for e in entries:
+        max_idx = max(max_idx, _extract_task_index(str(e.get("entry_id", ""))))
+    return max_idx + 1
 
 
 def _count_jsonl(path: Path) -> int:
@@ -93,6 +123,11 @@ def _classify_profile(
     except Exception as e:
         entry_warnings.append(f"parse error: {e}")
 
+    if n_entries != EXPECTED_ENTRIES_PER_PROFILE:
+        entry_warnings.append(
+            f"entry count mismatch: expected {EXPECTED_ENTRIES_PER_PROFILE}, got {n_entries}"
+        )
+
     if entry_warnings:
         return "warn", n_entries, entry_warnings
     return "ok", n_entries, []
@@ -140,7 +175,108 @@ async def _fix_one_profile(
 
         entries: list[dict] = []
         last_error: str | None = None
+        entries_jsonl = profile_dir / "entries.jsonl"
 
+        try:
+            current_entries = _load_entries_jsonl(entries_jsonl)
+        except Exception:
+            current_entries = []
+
+        def _sort_entries(xs: list[dict]) -> list[dict]:
+            return sorted(
+                xs,
+                key=lambda e: _extract_task_index(str(e.get("entry_id", ""))),
+            )
+
+        def _normalize_new_entry(e: dict, task_idx: int) -> dict:
+            e = dict(e)
+            e["kb_name"] = kb_name
+            e["profile"] = profile
+            e["entry_id"] = f"{kb_name}_{profile_id}_task_{task_idx:03d}"
+            return e
+
+        # If there are too many entries, keep the first N and rewrite files.
+        if len(current_entries) > EXPECTED_ENTRIES_PER_PROFILE:
+            trimmed = _sort_entries(current_entries)[:EXPECTED_ENTRIES_PER_PROFILE]
+            _save_profile_entries(trimmed, profile_dir)
+            if not (profile_dir / "profile.json").exists():
+                with open(profile_dir / "profile.json", "w", encoding="utf-8") as f:
+                    json.dump(profile, f, ensure_ascii=False, indent=2)
+            result["num_entries"] = len(trimmed)
+            print(
+                f"    {ANSI_GREEN}✓ fixed: trimmed to {len(trimmed)} entries{ANSI_RESET}"
+            )
+            return result
+
+        # If entries exist but are fewer than expected, supplement missing ones.
+        if 0 < len(current_entries) < EXPECTED_ENTRIES_PER_PROFILE:
+            merged = _sort_entries(current_entries)
+            needed = EXPECTED_ENTRIES_PER_PROFILE - len(merged)
+            print(
+                f"    {ANSI_CYAN}supplementing {needed} missing entries for {profile_id}{ANSI_RESET}"
+            )
+            seen_signatures = {
+                (
+                    str((e.get("task") or {}).get("title", "")).strip().lower(),
+                    str((e.get("task") or {}).get("description", "")).strip().lower(),
+                )
+                for e in merged
+            }
+            next_idx = _next_task_index(merged)
+            for attempt in range(1, FIX_RETRY_ATTEMPTS + 1):
+                try:
+                    candidates = await _generate_entries_for_profile(
+                        kb_name=kb_name,
+                        profile=profile,
+                        knowledge_scope=scope,
+                        cfg=cfg,
+                        kb_base_dir=kb_base_dir,
+                    )
+                except Exception as e:
+                    last_error = str(e)
+                    print(
+                        f"    {ANSI_YELLOW}supplement attempt {attempt}/{FIX_RETRY_ATTEMPTS} "
+                        f"failed: {e}{ANSI_RESET}"
+                    )
+                    if attempt < FIX_RETRY_ATTEMPTS:
+                        await asyncio.sleep(FIX_RETRY_DELAY_SEC * attempt)
+                    continue
+
+                added_this_round = 0
+                for c in candidates:
+                    sig = (
+                        str((c.get("task") or {}).get("title", "")).strip().lower(),
+                        str((c.get("task") or {}).get("description", "")).strip().lower(),
+                    )
+                    if sig in seen_signatures:
+                        continue
+                    merged.append(_normalize_new_entry(c, next_idx))
+                    seen_signatures.add(sig)
+                    next_idx += 1
+                    added_this_round += 1
+                    if len(merged) >= EXPECTED_ENTRIES_PER_PROFILE:
+                        break
+
+                if len(merged) >= EXPECTED_ENTRIES_PER_PROFILE:
+                    _save_profile_entries(merged[:EXPECTED_ENTRIES_PER_PROFILE], profile_dir)
+                    if not (profile_dir / "profile.json").exists():
+                        with open(profile_dir / "profile.json", "w", encoding="utf-8") as f:
+                            json.dump(profile, f, ensure_ascii=False, indent=2)
+                    result["num_entries"] = EXPECTED_ENTRIES_PER_PROFILE
+                    print(
+                        f"    {ANSI_GREEN}✓ fixed: supplemented to {EXPECTED_ENTRIES_PER_PROFILE} entries{ANSI_RESET}"
+                    )
+                    return result
+
+                print(
+                    f"    {ANSI_YELLOW}supplement attempt {attempt}/{FIX_RETRY_ATTEMPTS} "
+                    f"added {added_this_round}, still missing "
+                    f"{EXPECTED_ENTRIES_PER_PROFILE - len(merged)}{ANSI_RESET}"
+                )
+                if attempt < FIX_RETRY_ATTEMPTS:
+                    await asyncio.sleep(FIX_RETRY_DELAY_SEC * attempt)
+
+        # Full regeneration (for empty/missing or supplement fallback).
         for attempt in range(1, FIX_RETRY_ATTEMPTS + 1):
             try:
                 entries = await _generate_entries_for_profile(
@@ -172,6 +308,7 @@ async def _fix_one_profile(
                 await asyncio.sleep(FIX_RETRY_DELAY_SEC * attempt)
 
         if entries:
+            entries = _sort_entries(entries)[:EXPECTED_ENTRIES_PER_PROFILE]
             _save_profile_entries(entries, profile_dir)
             if not (profile_dir / "profile.json").exists():
                 with open(profile_dir / "profile.json", "w", encoding="utf-8") as f:
@@ -222,14 +359,18 @@ def _load_scope(kb_name: str, entries_root: Path) -> dict | None:
 def scan_entries(
     entries_root: Path, kb_names: list[str]
 ) -> tuple[
-    list[str], list[str], list[str], list[str],
+    list[str], list[str], list[str], list[str], list[str],
     dict[str, list[str]], int, int
 ]:
-    """Scan and classify all profiles. Returns (ok, warn, empty, missing, kb_details, total_profiles, total_entries)."""
+    """Scan and classify all profiles.
+
+    Returns (ok, warn, empty, missing, count_mismatch, kb_details, total_profiles, total_entries).
+    """
     ok_profiles: list[str] = []
     warn_profiles: list[str] = []
     empty_profiles: list[str] = []
     missing_profiles: list[str] = []
+    count_mismatch_profiles: list[str] = []
     kb_details: dict[str, list[str]] = {}
     total_profiles = 0
     total_entries = 0
@@ -283,6 +424,8 @@ def scan_entries(
                 )
             elif status == "warn":
                 warn_profiles.append(full_id)
+                if any(w.startswith("entry count mismatch:") for w in warnings):
+                    count_mismatch_profiles.append(full_id)
                 kb_lines.append(
                     f"    {ANSI_YELLOW}⚠{ANSI_RESET} {profile_id}  "
                     f"{n_entries} entries  "
@@ -305,7 +448,16 @@ def scan_entries(
 
         kb_details[kb_name] = kb_lines
 
-    return ok_profiles, warn_profiles, empty_profiles, missing_profiles, kb_details, total_profiles, total_entries
+    return (
+        ok_profiles,
+        warn_profiles,
+        empty_profiles,
+        missing_profiles,
+        count_mismatch_profiles,
+        kb_details,
+        total_profiles,
+        total_entries,
+    )
 
 
 def print_report(
@@ -315,6 +467,7 @@ def print_report(
     warn_profiles: list[str],
     empty_profiles: list[str],
     missing_profiles: list[str],
+    count_mismatch_profiles: list[str],
     kb_details: dict[str, list[str]],
     total_profiles: int,
     total_entries: int,
@@ -362,6 +515,13 @@ def print_report(
     for p in missing_profiles:
         print(f"    {ANSI_DIM}{p}{ANSI_RESET}")
 
+    print(
+        f"  {ANSI_YELLOW}COUNT_MISMATCH{ANSI_RESET}: {len(count_mismatch_profiles)} "
+        f"(expected {EXPECTED_ENTRIES_PER_PROFILE})"
+    )
+    for p in count_mismatch_profiles:
+        print(f"    {ANSI_DIM}{p}{ANSI_RESET}")
+
     print()
 
 
@@ -385,18 +545,27 @@ async def run(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # --- First pass: scan ---
-    ok, warn, empty, missing, details, total_profiles, total_entries = scan_entries(
-        entries_root, kb_names
-    )
+    (
+        ok,
+        warn,
+        empty,
+        missing,
+        count_mismatch,
+        details,
+        total_profiles,
+        total_entries,
+    ) = scan_entries(entries_root, kb_names)
     print_report(
-        kb_names, entries_root, ok, warn, empty, missing, details,
+        kb_names, entries_root, ok, warn, empty, missing, count_mismatch, details,
         total_profiles, total_entries,
     )
 
-    unhealthy = empty + missing
+    unhealthy = empty + missing + count_mismatch
     if not args.fix or not unhealthy:
         if unhealthy:
-            print(f"Run with {ANSI_CYAN}--fix{ANSI_RESET} to regenerate unhealthy entries.\n")
+            print(
+                f"Run with {ANSI_CYAN}--fix{ANSI_RESET} to regenerate/fix unhealthy entries.\n"
+            )
             sys.exit(1)
         return
 
@@ -468,11 +637,20 @@ async def run(args: argparse.Namespace) -> None:
     # --- Second pass: re-scan ---
     print(f"\n{'=' * 80}")
     print(f"{ANSI_BOLD}Post-fix re-scan{ANSI_RESET}")
-    ok2, warn2, empty2, missing2, details2, tp2, te2 = scan_entries(
+    ok2, warn2, empty2, missing2, count_mismatch2, details2, tp2, te2 = scan_entries(
         entries_root, kb_names
     )
     print_report(
-        kb_names, entries_root, ok2, warn2, empty2, missing2, details2, tp2, te2
+        kb_names,
+        entries_root,
+        ok2,
+        warn2,
+        empty2,
+        missing2,
+        count_mismatch2,
+        details2,
+        tp2,
+        te2,
     )
 
     print(f"{ANSI_BOLD}Fix summary{ANSI_RESET}")
@@ -484,7 +662,7 @@ async def run(args: argparse.Namespace) -> None:
             print(f"    {ANSI_DIM}{s}{ANSI_RESET}")
     print()
 
-    if empty2 or missing2:
+    if empty2 or missing2 or count_mismatch2:
         sys.exit(1)
 
 
@@ -503,7 +681,10 @@ def main() -> None:
     parser.add_argument(
         "--fix",
         action="store_true",
-        help="Regenerate entries for unhealthy (empty/missing) profiles",
+        help=(
+            "Fix unhealthy profiles: regenerate empty/missing, "
+            "supplement <3 entries, trim >3 entries"
+        ),
     )
     parser.add_argument(
         "--kb-dir",
