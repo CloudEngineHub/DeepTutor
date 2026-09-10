@@ -21,6 +21,8 @@ from deeptutor.services.llm import (
 from deeptutor.services.prompt.language import append_language_directive
 from deeptutor.utils.json_parser import parse_json_response
 
+from ..json_retry import RETRY_REASONING_EFFORT, json_payload_is_usable
+
 
 async def llm_text(
     *,
@@ -81,15 +83,6 @@ def _normalize_json_payload(data: Any, expected_key: str | None = None) -> dict[
     return {}
 
 
-def _json_has_expected(data: dict[str, Any], expected_key: str | None) -> bool:
-    if not data:
-        return False
-    if expected_key is None:
-        return True
-    value = data.get(expected_key)
-    return bool(value)
-
-
 def _strip_thinking_preamble(text: str) -> str:
     """Strip model thinking/reasoning preamble before JSON output.
 
@@ -145,9 +138,9 @@ async def llm_json(
     Reasoning models can spend the whole response budget on hidden/scratchpad
     tokens and leave the visible JSON object empty. For structured book blocks
     we first honor the configured reasoning mode, then retry once with low
-    reasoning effort if parsing fails or the expected top-level key is missing.
-    ("low" rather than "minimal": local/Qwen models served via vLLM reject
-    "minimal", and "minimal" disables thinking entirely.)
+    reasoning effort if parsing fails or the expected top-level key is missing
+    — the same rule the Book pipeline agents apply via
+    :func:`deeptutor.book.json_retry.json_with_reasoning_retry`.
 
     Also strips thinking/reasoning preamble text (common with local models)
     before JSON parsing.
@@ -176,12 +169,12 @@ async def llm_json(
         return _normalize_json_payload(recovered, expected_key=expected_key)
 
     data = await _once(None)
-    if _json_has_expected(data, expected_key):
+    if json_payload_is_usable(data, expected_key):
         return data
 
-    retry_data = await _once("low")
-    if _json_has_expected(retry_data, expected_key):
-        retry_data.setdefault("_metadata", {})["reasoning_retry"] = "low"
+    retry_data = await _once(RETRY_REASONING_EFFORT)
+    if json_payload_is_usable(retry_data, expected_key):
+        retry_data.setdefault("_metadata", {})["reasoning_retry"] = RETRY_REASONING_EFFORT
         return retry_data
     return data or retry_data
 
