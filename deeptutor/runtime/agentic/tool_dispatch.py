@@ -119,7 +119,12 @@ async def dispatch_tool_calls(
             )
         tool_calls = tool_calls[:MAX_PARALLEL_TOOL_CALLS]
 
-    prepared, raw_args = _prepare_tool_args(tool_calls, context, kwarg_augmenter)
+    prepared, raw_args = _prepare_tool_args(
+        tool_calls,
+        context,
+        kwarg_augmenter,
+        registry=registry,
+    )
     # Collapse duplicates within this parallel batch. Models occasionally
     # emit repeated tool_calls in one assistant message. For most tools,
     # "duplicate" means same tool + same JSON-normalised args. For
@@ -224,7 +229,16 @@ async def dispatch_tool_calls(
             if duplicate_of.get(index) is not None:
                 continue
             call_id, name, _stale = prepared[index]
-            prepared[index] = (call_id, name, kwarg_augmenter(name, raw_args[index], context))
+            canonical_name, resolved_args = _resolve_tool_request(
+                registry,
+                name,
+                raw_args[index],
+            )
+            prepared[index] = (
+                call_id,
+                name,
+                kwarg_augmenter(canonical_name, resolved_args, context),
+            )
 
     # Three ordered stages around one concurrent middle. Every call in a round
     # has its args bound before any of them runs, so a tool that *changes what
@@ -431,6 +445,8 @@ def _prepare_tool_args(
     tool_calls: list[dict[str, Any]],
     context: UnifiedContext,
     kwarg_augmenter: KwargAugmenter | None,
+    *,
+    registry: ToolLookup | None = None,
 ) -> tuple[list[tuple[str, str, dict[str, Any]]], list[dict[str, Any]]]:
     """Bind each call's execution args, keeping the model's originals.
 
@@ -449,14 +465,41 @@ def _prepare_tool_args(
         )
         if not isinstance(tool_args, dict):
             tool_args = {}
+        canonical_name, resolved_args = _resolve_tool_request(registry, tool_name, tool_args)
         exec_args = (
-            kwarg_augmenter(tool_name, tool_args, context)
+            kwarg_augmenter(canonical_name, resolved_args, context)
             if kwarg_augmenter is not None
-            else dict(tool_args)
+            else resolved_args
         )
         prepared.append((tool_call_id, tool_name, exec_args))
         raw_args.append(dict(tool_args))
     return prepared, raw_args
+
+
+def _resolve_tool_request(
+    registry: ToolLookup | None,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Resolve aliases and their defaults before server-owned augmentation.
+
+    Execution retains the model-provided name so trace rows remain faithful.
+    Registries without alias support keep the original name and arguments.
+    """
+    if registry is None:
+        return tool_name, dict(tool_args)
+    resolver = getattr(registry, "resolve_request", None)
+    if callable(resolver):
+        try:
+            resolved_name, resolved_args = resolver(tool_name, tool_args)
+            return str(resolved_name or tool_name), dict(resolved_args)
+        except Exception:
+            return tool_name, dict(tool_args)
+    try:
+        tool = registry.get(tool_name)
+    except Exception:
+        return tool_name, dict(tool_args)
+    return str(getattr(tool, "name", "") or tool_name), dict(tool_args)
 
 
 def _build_per_tool_trace_meta(
