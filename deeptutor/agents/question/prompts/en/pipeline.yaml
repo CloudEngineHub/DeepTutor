@@ -322,7 +322,7 @@ notices:
   start_retrieval: "Starting retrieval"
   empty_tool_result: "The tool completed without returning text output."
   too_many_tool_calls: "The model requested {requested} tools. At most {limit} can run in parallel in one iteration, so the list was truncated."
-  tool_unknown_error: "An unknown error occurred while executing {tool}."
+  tool_error: "{tool} failed: {error}"
   protocol_retry: "The model violated the action-label protocol; retrying this iteration."
   max_iterations_reached: "Reached the iteration ceiling. Producing the best output I can with what I have."
   context_window_guard: "Trimmed older tool results to keep within the model's context window."

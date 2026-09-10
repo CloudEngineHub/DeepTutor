@@ -70,7 +70,10 @@ from deeptutor.runtime.agentic import (
 )
 from deeptutor.runtime.agentic.labels import find_inline_labels
 from deeptutor.runtime.agentic.messages import assistant_message
-from deeptutor.runtime.agentic.tool_dispatch import MAX_PARALLEL_TOOL_CALLS
+from deeptutor.runtime.agentic.tool_dispatch import (
+    MAX_PARALLEL_TOOL_CALLS,
+    tool_error_message_factory,
+)
 from deeptutor.runtime.agentic.usage import record_streamed_usage
 from deeptutor.runtime.registry.tool_registry import get_tool_registry
 from deeptutor.runtime.stream_bus import StreamBus
@@ -1997,11 +2000,7 @@ class _BaseLoopHost:
                 "notices.start_retrieval", default="Starting retrieval"
             ),
             too_many_tool_calls_message=too_many,
-            unknown_error_message_factory=lambda tn: self._pipeline._t(
-                "notices.tool_unknown_error",
-                tool=tn,
-                default=f"Error executing {tn}.",
-            ),
+            tool_error_message_factory=tool_error_message_factory(self._pipeline._t),
             trace_id_prefix=self._trace_id_prefix,
         )
         pageindex_sources = [

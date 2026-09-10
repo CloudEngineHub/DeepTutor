@@ -303,7 +303,7 @@ notices:
   start_retrieval: "开始检索"
   empty_tool_result: "工具完成但未返回文本输出。"
   too_many_tool_calls: "模型请求了 {requested} 个工具。一次最多并行 {limit} 个，已截断。"
-  tool_unknown_error: "执行 {tool} 时出现未知错误。"
+  tool_error: "{tool} 执行失败：{error}"
   protocol_retry: "模型违反了动作标签协议；本轮重试。"
   max_iterations_reached: "已达迭代上限。基于当前已有内容产出输出。"
   context_window_guard: "为了保持在模型上下文窗口内，裁剪了较早的工具结果。"
