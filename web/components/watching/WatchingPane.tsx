@@ -40,6 +40,7 @@ import {
 import { stepTranscriptMatch, transcriptMatchIndexes } from '@/lib/transcript-search'
 import { videoTimeFromHref } from '@/lib/watching-citations'
 import { WatchingPlayer } from './WatchingPlayer'
+import { transcriptFollowScrollTop } from '@/lib/transcript-follow'
 
 export const WATCHING_ASK_EVENT = 'dt:watching-ask'
 
@@ -180,18 +181,18 @@ export function WatchingPane({ onClose }: { onClose(): void }) {
     const list = transcriptListRef.current
     const activeRow = list?.querySelector<HTMLButtonElement>('[data-active-cue="true"]')
     if (!list || !activeRow) return
-    const rowCenter =
-      activeRow.getBoundingClientRect().top -
-      list.getBoundingClientRect().top +
-      list.scrollTop -
-      list.clientHeight / 2 +
-      activeRow.clientHeight / 2
-    // Clamp the active row's centre to the middle 50% of the viewport so it
-    // sits near the caption overlay without jumping to the exact midpoint.
-    const upperMargin = list.clientHeight * 0.25
-    const lowerMargin = list.clientHeight * 0.75
-    const clampedTop = Math.min(Math.max(0, rowCenter - upperMargin), list.scrollHeight - list.clientHeight)
-    const targetTop = Math.max(0, Math.min(clampedTop, rowCenter - lowerMargin))
+    const targetTop = transcriptFollowScrollTop({
+      rowOffset:
+        activeRow.getBoundingClientRect().top -
+        list.getBoundingClientRect().top +
+        list.scrollTop,
+      rowHeight: activeRow.clientHeight,
+      viewportHeight: list.clientHeight,
+      contentHeight: list.scrollHeight,
+      currentScrollTop: list.scrollTop,
+    })
+    // Already inside the band: leave the list where the reader put it.
+    if (Math.abs(targetTop - list.scrollTop) < 1) return
     const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     list.scrollTo({
       top: targetTop,
