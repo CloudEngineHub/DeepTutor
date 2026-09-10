@@ -101,3 +101,22 @@ def test_tool_policy_defaults_bound_a_stall_without_multiplying_a_slow_tool(
 
     assert pipeline.tool_timeout == 240
     assert pipeline.tool_max_retries == 0
+
+
+def test_settings_layer_defaults_match_the_pipeline_defaults() -> None:
+    """The two layers that can decide the tool policy must not disagree.
+
+    ``_MAIN_YAML_RUNTIME_DEFAULTS`` is the fallback applied when a research
+    settings payload is written to main.yaml. If it holds different numbers
+    than ``ResearchPipeline`` reads as its own defaults, then saving settings
+    once — without touching either field — persists the table's values and the
+    pipeline default becomes unreachable, which is how #1316 hid a 4096 token
+    budget no user could raise.
+    """
+    from deeptutor.services.config.capabilities_settings import (
+        _MAIN_YAML_RUNTIME_DEFAULTS,
+    )
+
+    researching = _MAIN_YAML_RUNTIME_DEFAULTS["research"]["researching"]
+    assert researching["tool_timeout"] == 240
+    assert researching["tool_max_retries"] == 0
