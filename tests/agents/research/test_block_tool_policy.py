@@ -78,3 +78,26 @@ async def test_block_host_passes_tool_policy_to_dispatcher(
 
     assert captured["tool_timeout"] == 7
     assert captured["tool_max_retries"] == 2
+
+
+def test_tool_policy_defaults_bound_a_stall_without_multiplying_a_slow_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shipped pair is deliberate, so pin it.
+
+    A research tool is slow by nature — one ``rag`` call against a LightRAG or
+    GraphRAG index makes its own LLM calls first, and search-then-fetch waits
+    on someone else's site — so the ceiling has to be one only a stalled
+    provider reaches, and a retry must not re-pay it for a tool that was going
+    to succeed. Neither number is pinned anywhere else: the policy tests above
+    pass whatever they configure.
+    """
+    monkeypatch.setattr("deeptutor.agents.research.pipeline.get_llm_config", lambda: _FakeLLM())
+    monkeypatch.setattr(
+        "deeptutor.agents.research.pipeline.get_tool_registry", lambda: _FakeRegistry()
+    )
+
+    pipeline = ResearchPipeline(language="en", runtime_config={})
+
+    assert pipeline.tool_timeout == 240
+    assert pipeline.tool_max_retries == 0

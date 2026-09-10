@@ -397,12 +397,21 @@ class ResearchPipeline:
             key="max_iterations",
             default=DEFAULT_BLOCK_MAX_ITERATIONS,
         )
+        # A ceiling on a stalled provider, not a service-level objective. A
+        # research tool is not quick by nature: one ``rag`` call against a
+        # LightRAG or GraphRAG index makes its own LLM calls before it returns
+        # anything, and a search-then-fetch chain waits on someone else's site.
+        # 60s would have cancelled work that was going to succeed, and each
+        # retry then pays the full timeout again. 240s matches the ceiling
+        # ``geogebra_analysis`` uses for the same reason, and retries are off by
+        # default: only a caller who knows its tools are flaky (rather than
+        # slow) should pay for a second attempt.
         self.tool_timeout = max(
             1,
             _read_int(
                 researching,
                 key="tool_timeout",
-                default=60,
+                default=240,
             ),
         )
         self.tool_max_retries = max(
@@ -410,7 +419,7 @@ class ResearchPipeline:
             _read_int(
                 researching,
                 key="tool_max_retries",
-                default=3,
+                default=0,
             ),
         )
         self.max_parallel_topics = max(
