@@ -110,3 +110,28 @@ async def test_cancelling_an_unowned_parked_turn_frees_the_session(tmp_path) -> 
     assert row["failure_code"] == "worker_lost"
     following = await store.begin_turn(session_id, capability="chat")
     assert following["id"] != turn_id
+
+
+@pytest.mark.asyncio
+async def test_an_unowned_queued_turn_is_reclaimed_too(tmp_path) -> None:
+    """``queued`` and ``running`` orphans block a session exactly as a parked
+    one does, which is why the reaper is not named after one status."""
+    from deeptutor.app.service import TurnApplicationService
+    from deeptutor.runtime.coordination import MemoryCoordinator
+
+    store = SQLiteSessionStore(tmp_path / "s.sqlite3")
+    session = await store.create_session("Orphan")
+    session_id = session["id"]
+    turn = await store.begin_turn(session_id, capability="chat")
+    application = TurnApplicationService(
+        SimpleNamespace(get=lambda: store),
+        SimpleNamespace(get=lambda _store: TurnRuntimeManager(store)),
+        MemoryCoordinator(lease_ttl_seconds=5),
+    )
+
+    assert await application.cancel_turn(turn["id"]) is True
+
+    row = await store.get_turn(turn["id"])
+    assert row is not None and row["status"] == "failed"
+    following = await store.begin_turn(session_id, capability="chat")
+    assert following["id"] != turn["id"]
