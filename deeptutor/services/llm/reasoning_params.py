@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+#: Reasoning level to ask for on a second attempt, after a first one spent its
+#: whole ``max_tokens`` budget thinking and returned no answer. ``"low"``
+#: rather than ``"minimal"``: local/Qwen models served via vLLM reject
+#: ``"minimal"``, and it disables thinking outright rather than trimming it.
+RETRY_REASONING_EFFORT = "low"
+
 _THINKING_STYLE_MAP = {
     "thinking_type": lambda enabled: {"thinking": {"type": "enabled" if enabled else "disabled"}},
     "enable_thinking": lambda enabled: {"enable_thinking": enabled},
@@ -174,6 +180,7 @@ def build_openai_compatible_reasoning_kwargs(
 
 
 __all__ = [
+    "RETRY_REASONING_EFFORT",
     "build_openai_compatible_reasoning_kwargs",
     "default_reasoning_effort_for",
 ]

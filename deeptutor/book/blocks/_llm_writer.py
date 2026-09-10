@@ -18,10 +18,11 @@ from deeptutor.services.llm import (
 from deeptutor.services.llm import (
     complete as llm_complete,
 )
+from deeptutor.services.llm.reasoning_params import RETRY_REASONING_EFFORT
 from deeptutor.services.prompt.language import append_language_directive
 from deeptutor.utils.json_parser import parse_json_response
 
-from ..json_retry import RETRY_REASONING_EFFORT, json_payload_is_usable
+from ..json_retry import json_payload_is_usable
 
 
 async def llm_text(
